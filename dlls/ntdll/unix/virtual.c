@@ -4999,9 +4999,9 @@ static NTSTATUS get_working_set_ex( HANDLE process, LPCVOID addr,
     return STATUS_SUCCESS;
 }
 
-static NTSTATUS read_nt_symlink( UNICODE_STRING *name, WCHAR *target, DWORD size )
+static unsigned int read_nt_symlink( UNICODE_STRING *name, UNICODE_STRING *targetW )
 {
-    NTSTATUS status;
+    unsigned int status;
     OBJECT_ATTRIBUTES attr;
     HANDLE handle;
 
@@ -5014,101 +5014,93 @@ static NTSTATUS read_nt_symlink( UNICODE_STRING *name, WCHAR *target, DWORD size
 
     if (!(status = NtOpenSymbolicLinkObject( &handle, SYMBOLIC_LINK_QUERY, &attr )))
     {
-        UNICODE_STRING targetW;
-        targetW.Buffer = target;
-        targetW.MaximumLength = (size - 1) * sizeof(WCHAR);
-        status = NtQuerySymbolicLinkObject( handle, &targetW, NULL );
-        if (!status) target[targetW.Length / sizeof(WCHAR)] = 0;
+        status = NtQuerySymbolicLinkObject( handle, targetW, NULL );
         NtClose( handle );
     }
     return status;
 }
 
-static NTSTATUS resolve_drive_symlink( UNICODE_STRING *name, SIZE_T max_name_len, SIZE_T *ret_len, NTSTATUS status )
+static unsigned int follow_device_symlink( WCHAR *name_ret, SIZE_T max_ret_len,
+                                       WCHAR *buffer, SIZE_T buffer_len,
+                                       SIZE_T *current_path_len )
 {
-    static int enabled = -1;
+    unsigned int status = STATUS_SUCCESS;
+    SIZE_T devname_len = 6 * sizeof(WCHAR); /* e.g. \??\C: */
+    UNICODE_STRING devname, targetW;
 
-    static const WCHAR dosprefixW[] = {'\\','?','?','\\'};
-    UNICODE_STRING device_name;
-    SIZE_T required_length, symlink_len;
-    WCHAR symlink[256];
-    size_t offset = 0;
+    if (*current_path_len >= devname_len && buffer[devname_len / sizeof(WCHAR) - 1] == ':') {
+        devname.Buffer = buffer;
+        devname.Length = devname_len;
 
-    if (enabled == -1)
-    {
-        const char *sgi = getenv("SteamGameId");
+        targetW.Buffer = buffer + (*current_path_len / sizeof(WCHAR));
+        targetW.MaximumLength = buffer_len - *current_path_len - sizeof(WCHAR);
+        if (!(status = read_nt_symlink( &devname, &targetW )))
+        {
+            *current_path_len -= devname_len; /* skip the device name */
+            *current_path_len += targetW.Length;
 
-        enabled = sgi && !strcmp(sgi, "284160");
+            if (*current_path_len <= max_ret_len)
+            {
+                memcpy( name_ret, targetW.Buffer, targetW.Length ); /* Copy the drive path */
+                memcpy( name_ret + targetW.Length / sizeof(WCHAR), /* Copy the rest of the path */
+                        buffer + devname_len / sizeof(WCHAR),
+                        *current_path_len - targetW.Length );
+            }
+            else status = STATUS_BUFFER_OVERFLOW;
+        }
     }
-    if (!enabled) return status;
-    if (status == STATUS_INFO_LENGTH_MISMATCH)
-    {
-        /* FIXME */
-        *ret_len += 64;
-        return status;
+    else if (*current_path_len <= max_ret_len) {
+        memcpy( name_ret, buffer, *current_path_len );
     }
-    if (status) return status;
+    else status = STATUS_BUFFER_OVERFLOW;
 
-    if (name->Length < sizeof(dosprefixW) ||
-            memcmp( name->Buffer, dosprefixW, sizeof(dosprefixW) ))
-        return STATUS_SUCCESS;
-
-    offset = ARRAY_SIZE(dosprefixW);
-    while (offset * sizeof(WCHAR) < name->Length && name->Buffer[ offset ] != '\\') offset++;
-
-    device_name = *name;
-    device_name.Length = offset * sizeof(WCHAR);
-    if ((status = read_nt_symlink( &device_name, symlink, ARRAY_SIZE( symlink ))))
-    {
-        ERR("read_nt_symlink failed, status %#x.\n", (int)status);
-        return status;
-    }
-    symlink_len = wcslen( symlink );
-    required_length = symlink_len * sizeof(WCHAR) +
-           name->Length - offset * sizeof(WCHAR) + sizeof(WCHAR);
-    if (ret_len)
-        *ret_len = sizeof(MEMORY_SECTION_NAME) + required_length;
-    if (required_length > max_name_len)
-        return STATUS_INFO_LENGTH_MISMATCH;
-
-    memmove( name->Buffer + symlink_len, name->Buffer + offset, name->Length - offset * sizeof(WCHAR) );
-    memcpy( name->Buffer, symlink, symlink_len * sizeof(WCHAR) );
-    name->MaximumLength = required_length;
-    name->Length = required_length - sizeof(WCHAR);
-    name->Buffer[name->Length / sizeof(WCHAR)] = 0;
-    return STATUS_SUCCESS;
+    return status;
 }
 
 static unsigned int get_memory_section_name( HANDLE process, LPCVOID addr,
                                              MEMORY_SECTION_NAME *info, SIZE_T len, SIZE_T *ret_len )
 {
+    SIZE_T current_path_len, max_path_len = 0;
+    /* buffer to hold the path + 6 chars devname (e.g. \??\C:) */
+    SIZE_T buffer_len = (MAX_PATH + 6) * sizeof(WCHAR);
+    WCHAR *buffer = NULL;
     unsigned int status;
 
     if (!info) return STATUS_ACCESS_VIOLATION;
+    if (!(buffer = malloc( buffer_len ))) return STATUS_NO_MEMORY;
+    if (len > sizeof(*info) + sizeof(WCHAR))
+    {
+        max_path_len = len - sizeof(*info) - sizeof(WCHAR); /* dont count null char */
+    }
 
     SERVER_START_REQ( get_mapping_filename )
     {
         req->process = wine_server_obj_handle( process );
         req->addr = wine_server_client_ptr( addr );
-        if (len > sizeof(*info) + sizeof(WCHAR))
-            wine_server_set_reply( req, info + 1, len - sizeof(*info) - sizeof(WCHAR) );
+	wine_server_set_reply( req, buffer, MAX_PATH );
         status = wine_server_call( req );
-        if (!status || status == STATUS_BUFFER_OVERFLOW)
+        if (!status)
         {
-            if (ret_len) *ret_len = sizeof(*info) + reply->len + sizeof(WCHAR);
-            if (len < sizeof(*info)) status = STATUS_INFO_LENGTH_MISMATCH;
+            current_path_len = reply->len;
+            status = follow_device_symlink( (WCHAR *)(info + 1), max_path_len, buffer, buffer_len, &current_path_len);
+            if (len < sizeof(*info))
+            {
+                status = STATUS_INFO_LENGTH_MISMATCH;
+            }
+
+            if (ret_len) *ret_len = sizeof(*info) + current_path_len + sizeof(WCHAR);
             if (!status)
             {
                 info->SectionFileName.Buffer = (WCHAR *)(info + 1);
-                info->SectionFileName.Length = reply->len;
-                info->SectionFileName.MaximumLength = reply->len + sizeof(WCHAR);
-                info->SectionFileName.Buffer[reply->len / sizeof(WCHAR)] = 0;
+                info->SectionFileName.Length = current_path_len;
+                info->SectionFileName.MaximumLength = current_path_len + sizeof(WCHAR);
+                info->SectionFileName.Buffer[current_path_len / sizeof(WCHAR)] = 0;
             }
         }
     }
     SERVER_END_REQ;
-
-    return resolve_drive_symlink( &info->SectionFileName, len - sizeof(*info), ret_len, status );
+    free(buffer);
+    return status;
 }
 
 
