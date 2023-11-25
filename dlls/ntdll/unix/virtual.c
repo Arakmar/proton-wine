@@ -526,6 +526,21 @@ static void reserve_area( void *addr, void *end )
 #endif /* __APPLE__ */
 }
 
+/* This might look like a hack, but it actually isn't - the 'experimental' version
+ * is correct, but it already has revealed a couple of additional Wine bugs, which
+ * were not triggered before, and there are probably some more.
+ * To avoid breaking Wine for everyone, the new correct implementation has to be
+ * manually enabled, until it is tested a bit more. */
+static inline BOOL experimental_WRITECOPY( void )
+{
+    static int enabled = -1;
+    if (enabled == -1)
+    {
+        const char *str = getenv("STAGING_WRITECOPY");
+        enabled = str && (atoi(str) != 0);
+    }
+    return enabled;
+}
 
 static void mmap_init( const struct preload_info *preload_info )
 {
@@ -1740,12 +1755,22 @@ static BOOL set_vprot( struct file_view *view, void *base, size_t size, BYTE vpr
     if (!use_kernel_writewatch && view->protect & VPROT_WRITEWATCH)
     {
         /* each page may need different protections depending on write watch flag */
-        set_page_vprot_bits( base, size, vprot & ~VPROT_WRITEWATCH, ~vprot & ~VPROT_WRITEWATCH );
+        set_page_vprot_bits( base, size, vprot & ~VPROT_WRITEWATCH, ~vprot & ~(VPROT_WRITEWATCH|VPROT_COPIED) );
         mprotect_range( base, size, 0, 0 );
         return TRUE;
     }
+
+    /* check that we can map this memory with PROT_WRITE since we cannot fail later,
+     * but we fallback to copying pages for read-only mappings in virtual_handle_fault */
+    if ((vprot & VPROT_WRITECOPY) && (view->protect & VPROT_WRITECOPY))
+        unix_prot |= PROT_WRITE;
+
     if (mprotect_exec( base, size, unix_prot )) return FALSE;
-    set_page_vprot( base, size, vprot );
+    /* each page may need different protections depending on writecopy */
+    set_page_vprot_bits( base, size, vprot, ~vprot & ~VPROT_COPIED );
+    if (vprot & VPROT_WRITECOPY)
+        mprotect_range( base, size, 0, 0 );
+
     return TRUE;
 }
 
@@ -1783,7 +1808,7 @@ static void update_write_watches( void *base, size_t size, size_t accessed_size 
 {
     TRACE( "updating watch %p-%p-%p\n", base, (char *)base + accessed_size, (char *)base + size );
     /* clear write watch flag on accessed pages */
-    set_page_vprot_bits( base, accessed_size, 0, VPROT_WRITEWATCH );
+    set_page_vprot_bits( base, accessed_size, VPROT_WRITE, VPROT_WRITEWATCH | VPROT_WRITECOPY );
     /* restore page protections on the entire range */
     mprotect_range( base, size, 0, 0 );
 }
@@ -2618,6 +2643,8 @@ static NTSTATUS map_image_into_view( struct file_view *view, const WCHAR *filena
                            ptr + sec->VirtualAddress + file_size,
                            ptr + sec->VirtualAddress + end );
             memset( ptr + sec->VirtualAddress + file_size, 0, end - file_size );
+            /* clear WRITTEN mark so QueryVirtualMemory returns correct values */
+            set_page_vprot_bits( ptr + sec->VirtualAddress + file_size, 1, 0, VPROT_COPIED );
         }
     }
 
@@ -3615,12 +3642,29 @@ NTSTATUS virtual_handle_fault( void *addr, DWORD err, void *stack )
             set_page_vprot_bits( page, page_size, 0, VPROT_WRITEWATCH );
             mprotect_range( page, page_size, 0, 0 );
         }
-        /* ignore fault if page is writable now */
-        if (get_unix_prot( get_page_vprot( page )) & PROT_WRITE)
+        if ((vprot & VPROT_WRITECOPY) && (vprot & VPROT_COMMITTED))
         {
-            if ((vprot & VPROT_WRITEWATCH) || is_write_watch_range( page, page_size ))
-                ret = STATUS_SUCCESS;
+            struct file_view *view = find_view( page, 0 );
+
+            set_page_vprot_bits( page, page_size, VPROT_WRITE | VPROT_COPIED, VPROT_WRITECOPY );
+            if (view->protect & VPROT_WRITECOPY)
+            {
+                mprotect_range( page, page_size, 0, 0 );
+            }
+            else
+            {
+                static BYTE *temp_page = NULL;
+                if (!temp_page)
+                    temp_page = anon_mmap_alloc( page_size, PROT_READ | PROT_WRITE );
+
+                /* original mapping is shared, replace with a private page */
+                memcpy( temp_page, page, page_size );
+                anon_mmap_fixed( page, page_size, get_unix_prot( vprot | VPROT_WRITE | VPROT_COPIED ), 0 );
+                memcpy( page, temp_page, page_size );
+            }
         }
+        /* ignore fault if page is writable now */
+        if (get_unix_prot( get_page_vprot( page ) ) & PROT_WRITE) ret = STATUS_SUCCESS;
     }
     else if (!err && (get_unix_prot( vprot ) & PROT_READ) && is_system_range( page, page_size ))
     {
@@ -4984,7 +5028,7 @@ static NTSTATUS get_working_set_ex( HANDLE process, LPCVOID addr,
             }
 
             p->VirtualAttributes.Valid = !(vprot & VPROT_GUARD) && (vprot & 0x0f) && (pagemap >> 63);
-            p->VirtualAttributes.Shared = !is_view_valloc( view ) && ((pagemap >> 61) & 1);
+            p->VirtualAttributes.Shared = (!is_view_valloc( view ) && ((pagemap >> 61) & 1)) || ((view->protect & VPROT_WRITECOPY) && !(vprot & VPROT_COPIED));
             if (p->VirtualAttributes.Shared && p->VirtualAttributes.Valid)
                 p->VirtualAttributes.ShareCount = 1; /* FIXME */
             if (p->VirtualAttributes.Valid)

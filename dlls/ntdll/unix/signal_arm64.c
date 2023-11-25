@@ -1421,6 +1421,12 @@ void DECLSPEC_HIDDEN call_init_thunk( LPTHREAD_START_ROUTINE entry, void *arg, B
     __wine_syscall_dispatcher_return( frame, 0 );
 }
 
+/**********************************************************************
+ *    signal_init_early
+ */
+void signal_init_early(void)
+{
+}
 
 /***********************************************************************
  *           signal_start_thread
