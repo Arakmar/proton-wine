@@ -87,6 +87,7 @@ struct thread
     struct timeout_user   *delay_priority;/* delayed set_thread_priority */
     int                    suspend;       /* suspend count */
     int                    dbg_hidden;    /* hidden from debugger */
+    int                    bypass_process_suspending; /* bypass process suspending for this thread */
     obj_handle_t           desktop;       /* desktop handle */
     int                    desktop_users; /* number of objects using the thread desktop */
     timeout_t              creation_time; /* Thread creation time */

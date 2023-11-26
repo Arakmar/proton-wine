@@ -1073,7 +1073,17 @@ void suspend_process( struct process *process )
         LIST_FOR_EACH_SAFE( ptr, next, &process->thread_list )
         {
             struct thread *thread = LIST_ENTRY( ptr, struct thread, proc_entry );
-            if (!thread->suspend) stop_thread( thread );
+            if (!thread->suspend) {
+                if (thread->bypass_process_suspending)
+                {
+                    fprintf(stderr, "suspend_process : NOT SUSPENDING THREAD because of bypass flag");
+                }
+                else
+                {
+                    fprintf(stderr, "suspend_process : SUSPENDING THREAD");
+                    stop_thread( thread );
+                }
+            }
         }
     }
 }
